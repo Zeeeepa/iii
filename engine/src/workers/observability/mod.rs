@@ -2415,26 +2415,29 @@ impl ObservabilityWorker {
                 let query_input = input.clone();
                 let query_view = run_blocking_query("traces::list summary view", move || {
                     if unfiltered {
-                        let mut roots = otel::get_query_root_spans();
+                        // Keys only: sorting and paging never decode a
+                        // payload, so the cost tracks the root count rather
+                        // than the size of the stored history.
+                        let mut roots = otel::get_query_root_span_keys();
                         if !include_internal {
-                            roots.retain(|span| !is_internal_span(span));
+                            roots.retain(|root| !root.is_internal);
                         }
                         roots.sort_by(|a, b| {
                             let cmp = a
-                                .start_time_unix_nano
-                                .cmp(&b.start_time_unix_nano)
+                                .start_time_ns
+                                .cmp(&b.start_time_ns)
                                 .then_with(|| a.trace_id.cmp(&b.trace_id))
                                 .then_with(|| a.span_id.cmp(&b.span_id));
                             if sort_order_asc { cmp } else { cmp.reverse() }
                         });
                         let mut seen = HashSet::new();
-                        roots.retain(|span| seen.insert(span.trace_id.clone()));
+                        roots.retain(|root| seen.insert(root.trace_id.clone()));
                         let total = roots.len();
                         let trace_ids: Vec<String> = roots
                             .into_iter()
                             .skip(offset)
                             .take(limit)
-                            .map(|span| span.trace_id)
+                            .map(|root| root.trace_id)
                             .collect();
                         (otel::get_query_spans_by_trace_ids(&trace_ids), Some(total))
                     } else if let Some(trace_id) = query_trace_id {
@@ -9337,6 +9340,195 @@ mod tests {
             }
             _ => panic!("expected list_traces success"),
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_trace_summaries_page_archived_roots_from_keys_one_row_per_trace() {
+        reset_observability_test_state();
+        let directory = tempfile::tempdir().expect("temp trace directory");
+        let _guard = attach_test_archive(directory.path());
+
+        let module = make_test_module(Arc::new(Engine::new()));
+        let span_storage = otel::get_span_storage().expect("span storage should exist");
+        span_storage.clear();
+        span_storage.add_spans(vec![
+            make_span("t-1", "r-1", None, "one", "svc", 1, 10, "ok", vec![]),
+            make_span(
+                "t-1",
+                "c-1",
+                Some("r-1"),
+                "one child",
+                "svc",
+                2,
+                9,
+                "ok",
+                vec![],
+            ),
+            // A second dangling root of the same distributed trace.
+            make_span(
+                "t-1",
+                "r-remote",
+                Some("remote-parent"),
+                "remote branch",
+                "svc",
+                3,
+                8,
+                "ok",
+                vec![],
+            ),
+            make_span("t-2", "r-2", None, "two", "svc", 20, 30, "ok", vec![]),
+            make_span(
+                "t-int",
+                "r-int",
+                None,
+                "internal",
+                "svc",
+                25,
+                26,
+                "ok",
+                vec![("function_id", "engine::traces::list")],
+            ),
+        ]);
+        flush_test_archive();
+        span_storage.clear();
+        // Hot-only: the newest trace, not archived yet.
+        span_storage.add_spans(vec![make_span(
+            "t-3",
+            "r-3",
+            None,
+            "three",
+            "svc",
+            40,
+            50,
+            "ok",
+            vec![],
+        )]);
+
+        let page = |offset: usize, limit: usize, order: &str, include_internal: bool| {
+            module.list_traces(TracesListInput {
+                offset: Some(offset),
+                limit: Some(limit),
+                sort_order: Some(order.to_string()),
+                include_internal: Some(include_internal),
+                ..Default::default()
+            })
+        };
+        let ids = |value: &TracesListResult| {
+            value
+                .traces
+                .iter()
+                .map(|trace| trace.trace_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        match page(0, 1, "asc", false).await {
+            FunctionResult::Success(value) => {
+                assert_eq!(value.total, 3, "one row per trace, internal excluded");
+                assert_eq!(ids(&value), vec!["t-1"]);
+                assert_eq!(value.traces[0].span_count, 3, "the page reads full spans");
+            }
+            _ => panic!("expected list_traces success"),
+        }
+        match page(0, 2, "desc", false).await {
+            FunctionResult::Success(value) => {
+                assert_eq!(ids(&value), vec!["t-3", "t-2"], "hot and archived merge");
+            }
+            _ => panic!("expected list_traces success"),
+        }
+        match page(1, 2, "desc", true).await {
+            FunctionResult::Success(value) => {
+                assert_eq!(value.total, 4);
+                assert_eq!(ids(&value), vec!["t-int", "t-2"]);
+            }
+            _ => panic!("expected list_traces success"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_list_traces_never_takes_a_hot_child_of_an_archived_span_for_a_root() {
+        reset_observability_test_state();
+        let directory = tempfile::tempdir().expect("temp trace directory");
+        let _guard = attach_test_archive(directory.path());
+
+        let module = make_test_module(Arc::new(Engine::new()));
+        let span_storage = otel::get_span_storage().expect("span storage should exist");
+        span_storage.clear();
+        // Archived: an internal root and its child.
+        span_storage.add_spans(vec![
+            make_span(
+                "t-int",
+                "r-int",
+                None,
+                "internal",
+                "svc",
+                10,
+                100,
+                "ok",
+                vec![("function_id", "engine::traces::list")],
+            ),
+            make_span(
+                "t-int",
+                "c-int",
+                Some("r-int"),
+                "child",
+                "svc",
+                20,
+                90,
+                "ok",
+                vec![],
+            ),
+        ]);
+        flush_test_archive();
+        span_storage.clear();
+        // Hot: a grandchild whose parent lives only in the archive, as a
+        // non-root the root view never loads. It is not a root.
+        span_storage.add_spans(vec![
+            make_span(
+                "t-int",
+                "g-int",
+                Some("c-int"),
+                "grandchild",
+                "svc",
+                50,
+                60,
+                "ok",
+                vec![],
+            ),
+            make_span(
+                "t-ext",
+                "r-ext",
+                None,
+                "external",
+                "svc",
+                40,
+                45,
+                "ok",
+                vec![],
+            ),
+        ]);
+
+        let list = |include_internal: bool| {
+            module.list_traces(TracesListInput {
+                include_internal: Some(include_internal),
+                sort_order: Some("desc".to_string()),
+                ..Default::default()
+            })
+        };
+        let ids = |result: FunctionResult<TracesListResult, ErrorBody>| match result {
+            FunctionResult::Success(value) => value
+                .traces
+                .iter()
+                .map(|trace| trace.trace_id.clone())
+                .collect::<Vec<_>>(),
+            _ => panic!("expected list_traces success"),
+        };
+
+        // The internal trace stays hidden, and with internals it sorts by its
+        // real root (start 10), not by the grandchild (start 50).
+        assert_eq!(ids(list(false).await), vec!["t-ext"]);
+        assert_eq!(ids(list(true).await), vec!["t-ext", "t-int"]);
     }
 
     #[tokio::test]
