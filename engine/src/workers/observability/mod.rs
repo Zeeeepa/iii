@@ -94,6 +94,11 @@ pub struct TracesListInput {
     /// `engine::traces::spans` and `engine::traces::tree`.
     #[serde(default)]
     attribute_projection: Option<Vec<String>>,
+    /// `engine::traces::spans` only: `false` returns each span without its
+    /// `events` and `links`, where invocation payloads ride, for views that
+    /// draw spans without opening one. Defaults to true.
+    #[serde(default)]
+    include_events: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Default, JsonSchema)]
@@ -2934,9 +2939,14 @@ impl ObservabilityWorker {
                     };
                 let tag_elapsed = tag_started.elapsed();
                 let serialization_started = Instant::now();
+                let include_events = input.include_events.unwrap_or(true);
                 let result_spans: Vec<Value> = spans
                     .into_iter()
-                    .map(|s| {
+                    .map(|mut s| {
+                        if !include_events {
+                            s.events.clear();
+                            s.links.clear();
+                        }
                         let tags = tags_by_trace_id
                             .get(&s.trace_id)
                             .cloned()
@@ -8013,6 +8023,7 @@ mod tests {
             include_internal: Some(false),
             search_all_spans: None,
             attribute_projection: None,
+            include_events: None,
         };
 
         let spans = match module.list_trace_spans(input).await {
@@ -8098,6 +8109,7 @@ mod tests {
             include_internal: Some(false),
             search_all_spans: None,
             attribute_projection: None,
+            include_events: None,
         };
 
         let order = |result: FunctionResult<TracesSpansResult, ErrorBody>| -> Vec<String> {
@@ -8227,6 +8239,7 @@ mod tests {
                 include_internal: Some(false),
                 search_all_spans: None,
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
 
@@ -8451,6 +8464,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: Some(true),
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
 
@@ -8532,6 +8546,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: Some(false),
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
         match result_root_only {
@@ -8564,6 +8579,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: Some(true),
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
         match result_all {
@@ -8640,6 +8656,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: Some(false),
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
 
@@ -9116,6 +9133,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: None,
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
 
@@ -9135,6 +9153,66 @@ mod tests {
             }
             _ => panic!("expected list_traces success"),
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_trace_spans_without_events_keep_everything_else() {
+        reset_observability_test_state();
+
+        let module = make_test_module(Arc::new(Engine::new()));
+        let span_storage = otel::get_span_storage().expect("span storage should exist");
+        span_storage.clear();
+        let mut span = make_span(
+            "t-1",
+            "s-1",
+            None,
+            "call tool",
+            "svc",
+            1,
+            2,
+            "ok",
+            vec![("iii.session.id", "s1")],
+        );
+        span.events = vec![otel::StoredSpanEvent {
+            name: "invocation".to_string(),
+            timestamp_unix_nano: 1,
+            attributes: vec![("iii.payload.json".to_string(), "{\"big\":true}".to_string())],
+        }];
+        span.links = vec![otel::StoredSpanLink {
+            trace_id: "t-0".to_string(),
+            span_id: "s-0".to_string(),
+            trace_state: None,
+            attributes: vec![],
+        }];
+        span_storage.add_spans(vec![span]);
+
+        let spans = |include_events: Option<bool>| {
+            module.list_trace_spans(TracesListInput {
+                trace_ids: Some(vec!["t-1".to_string()]),
+                include_events,
+                ..Default::default()
+            })
+        };
+        let only = |result: FunctionResult<TracesSpansResult, ErrorBody>| match result {
+            FunctionResult::Success(value) => {
+                assert_eq!(value.spans.len(), 1);
+                value.spans[0].clone()
+            }
+            _ => panic!("expected list_trace_spans success"),
+        };
+
+        let full = only(spans(None).await);
+        assert_eq!(full["events"][0]["name"], "invocation");
+        assert_eq!(full["links"][0]["span_id"], "s-0");
+
+        let bare = only(spans(Some(false)).await);
+        assert_eq!(bare["events"], serde_json::json!([]));
+        assert_eq!(bare["links"], serde_json::json!([]));
+        let mut rest = full.clone();
+        rest["events"] = serde_json::json!([]);
+        rest["links"] = serde_json::json!([]);
+        assert_eq!(bare, rest, "only events and links are dropped");
     }
 
     #[tokio::test]
@@ -9201,6 +9279,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: None,
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
 
@@ -10156,6 +10235,7 @@ mod tests {
                 include_internal: Some(true),
                 search_all_spans: None,
                 attribute_projection: None,
+                include_events: None,
             })
             .await;
 
