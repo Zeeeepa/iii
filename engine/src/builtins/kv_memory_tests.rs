@@ -243,6 +243,9 @@ async fn failed_scope_does_not_prevent_other_snapshots_and_can_retry() {
     assert_eq!(read_legacy(&dir, "healthy")["k"], Value::Bool(false));
     assert!(store.dirty.read().await.contains_key("blocked"));
     std::fs::remove_dir(dir.join(index_file_name("blocked"))).unwrap();
+    flush(&store).await.unwrap();
+    assert_eq!(read_legacy(&dir, "blocked")["k"], Value::Bool(true));
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
