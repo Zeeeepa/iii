@@ -259,7 +259,13 @@ pub async fn resolve_package(
 ) -> Result<ResolvedPackage> {
     let (registry, name) = split_reference(reference);
     let target = host_target();
-    let worker = resolve(container, &registry, &name, version_range, target).await?;
+    #[cfg(test)]
+    let endpoint = TEST_REGISTRY
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| registry.clone());
+    #[cfg(not(test))]
+    let endpoint = registry.clone();
+    let worker = resolve(container, &endpoint, &name, version_range, target).await?;
     into_resolved_package(container, &registry, worker, target)
 }
 
@@ -473,6 +479,11 @@ pub struct Graph {
     pub edges: Vec<(String, String)>,
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_REGISTRY: String;
+}
+
 /// Everything a worker needs, resolved in one request.
 ///
 /// The registry answers `/resolve` with the whole graph, not just the worker
@@ -481,6 +492,8 @@ pub struct Graph {
 /// different set, because each answer is computed on its own.
 pub async fn resolve_graph(container: &str, reference: &str, version_range: &str) -> Result<Graph> {
     let (registry, name) = split_reference(reference);
+    #[cfg(test)]
+    let registry = TEST_REGISTRY.try_with(Clone::clone).unwrap_or(registry);
     let target = host_target();
     let response = resolve_response(container, &registry, &name, version_range, target).await?;
     Ok(Graph {
