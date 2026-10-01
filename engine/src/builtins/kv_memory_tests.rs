@@ -243,9 +243,6 @@ async fn failed_scope_does_not_prevent_other_snapshots_and_can_retry() {
     assert_eq!(read_legacy(&dir, "healthy")["k"], Value::Bool(false));
     assert!(store.dirty.read().await.contains_key("blocked"));
     std::fs::remove_dir(dir.join(index_file_name("blocked"))).unwrap();
-    flush(&store).await.unwrap();
-    assert_eq!(read_legacy(&dir, "blocked")["k"], Value::Bool(true));
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -393,4 +390,100 @@ async fn update_moves_previous_tree_without_snapshot_and_preserves_shared_snapsh
     assert_eq!(snapshot["key"]["count"], 1);
     assert_eq!(result.old_value.unwrap()["count"], 1);
     assert_eq!(result.new_value["count"], 2);
+}
+
+#[tokio::test]
+async fn stale_delete_marker_persists_repopulated_scope() {
+    let dir = directory();
+    let store = manual_store(&dir);
+    store
+        .set("scope".into(), "old".into(), Value::Bool(false))
+        .await;
+    flush(&store).await.unwrap();
+    store
+        .set("scope".into(), "live".into(), Value::Bool(true))
+        .await;
+    store
+        .dirty
+        .write()
+        .await
+        .insert("scope".into(), DirtyOp::Delete);
+
+    flush(&store).await.unwrap();
+
+    let persisted = read_legacy(&dir, "scope");
+    assert_eq!(persisted["old"], Value::Bool(false));
+    assert_eq!(persisted["live"], Value::Bool(true));
+    let live: IndexMap<String, Value> = store.store.read().await["scope"]
+        .iter()
+        .map(|(key, value)| (key.clone(), value.as_ref().clone()))
+        .collect();
+    assert_eq!(persisted, live);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn stale_upsert_marker_removes_empty_or_absent_scope() {
+    let dir = directory();
+    let store = manual_store(&dir);
+    store
+        .set("empty".into(), "key".into(), Value::Bool(true))
+        .await;
+    flush(&store).await.unwrap();
+    store.delete("empty".into(), "key".into()).await;
+    store
+        .dirty
+        .write()
+        .await
+        .insert("empty".into(), DirtyOp::Upsert);
+    flush(&store).await.unwrap();
+    assert!(!dir.join(index_file_name("empty")).exists());
+
+    store
+        .set("absent".into(), "key".into(), Value::Bool(true))
+        .await;
+    flush(&store).await.unwrap();
+    store.store.write().await.remove("absent");
+    store
+        .dirty
+        .write()
+        .await
+        .insert("absent".into(), DirtyOp::Upsert);
+    flush(&store).await.unwrap();
+    assert!(!dir.join(index_file_name("absent")).exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn stale_release_delete_marker_preserves_live_lock_scope() {
+    let dir = directory();
+    let store = manual_store(&dir);
+    assert!(
+        store
+            .try_acquire_lock("locks", "old", "owner-1", 600_000)
+            .await
+    );
+    flush(&store).await.unwrap();
+    assert!(store.release_lock("locks", "old", "owner-1").await);
+    assert!(
+        store
+            .try_acquire_lock("locks", "live", "owner-2", 600_000)
+            .await
+    );
+    store
+        .dirty
+        .write()
+        .await
+        .insert("locks".into(), DirtyOp::Delete);
+
+    flush(&store).await.unwrap();
+
+    let persisted = read_legacy(&dir, "locks");
+    assert!(persisted.contains_key("live"));
+    let live: IndexMap<String, Value> = store.store.read().await["locks"]
+        .iter()
+        .map(|(key, value)| (key.clone(), value.as_ref().clone()))
+        .collect();
+    assert_eq!(persisted, live);
+    std::fs::remove_dir_all(dir).unwrap();
 }

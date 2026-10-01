@@ -364,15 +364,16 @@ impl BuiltinKvStore {
             let batch = dirty.blocking_write().drain().collect::<Vec<_>>();
             let mut failed = 0usize;
             for (index, op) in batch {
-                let result = match op {
-                    DirtyOp::Upsert => {
-                        let snapshot = store.blocking_read().get(&index).cloned();
-                        match snapshot {
-                            Some(value) => persist_index_to_disk(&dir, &index, &value),
-                            None => Ok(()),
-                        }
-                    }
-                    DirtyOp::Delete => delete_index_from_disk(&dir, &index),
+                // DirtyOp is only a marker: a mutation may have completed after
+                // it was recorded, so derive the disk action from current state.
+                let snapshot = store
+                    .blocking_read()
+                    .get(&index)
+                    .filter(|scope| !scope.is_empty())
+                    .cloned();
+                let result = match snapshot {
+                    Some(value) => persist_index_to_disk(&dir, &index, &value),
+                    None => delete_index_from_disk(&dir, &index),
                 };
                 if let Err(error) = result {
                     tracing::error!(error = ?error, index = %index, "failed to persist index");

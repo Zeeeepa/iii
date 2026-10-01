@@ -243,10 +243,24 @@ mod maintenance_tests {
             Duration::from_secs(60),
             Arc::new(|| {}),
         ));
-        drop(HeapMaintenance {
+        let mut maintenance = HeapMaintenance {
             shutdown,
             task: Some(task),
-        });
+        };
+        let mut task = maintenance
+            .task
+            .take()
+            .expect("maintenance task is present on Linux GNU");
+        drop(maintenance);
         assert!(*observe.borrow());
+        match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("maintenance task failed after drop: {error}"),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                panic!("maintenance task did not stop after guard drop");
+            }
+        }
     }
 }
